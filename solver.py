@@ -7,24 +7,44 @@ import time
 from utils.utils import *
 from model.AnomalyTransformer import AnomalyTransformer
 from data_factory.data_loader import get_loader_segment
-
+import contextlib
+import pandas as pd
+from torch.profiler import profile, record_function, ProfilerActivity
+from contextlib import nullcontext
+import torch.profiler
+from tqdm import tqdm
 
 def my_kl_loss(p, q):
-    res = p * (torch.log(p + 0.0001) - torch.log(q + 0.0001))
-    return torch.mean(torch.sum(res, dim=-1), dim=1)
+    p = torch.clamp(p, min=1e-7)
+    q = torch.clamp(q, min=1e-7)
+    return torch.mean(torch.sum(p * (torch.log(p) - torch.log(q)), dim=-1), dim=1)
 
 
-def adjust_learning_rate(optimizer, epoch, lr_):
-    lr_adjust = {epoch: lr_ * (0.5 ** ((epoch - 1) // 1))}
-    if epoch in lr_adjust.keys():
-        lr = lr_adjust[epoch]
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        print('Updating learning rate to {}'.format(lr))
+def adjust_learning_rate(optimizer, decay_step, base_lr):
+    decay_factor = 0.7 ** decay_step
+    for param_group in optimizer.param_groups:
+        if param_group['name'] == 'prior':
+            param_group['lr'] = base_lr * 10 * decay_factor
+        else:
+            param_group['lr'] = base_lr * decay_factor
+    print(f'Updated LRs - Series: {base_lr * decay_factor:.2e}, Prior: {base_lr * 10 * decay_factor:.2e}')
+
+def window_to_original(scores, win_size, original_length):
+    aggregated = np.zeros(original_length)
+    counts = np.zeros(original_length)
+    
+    for i in range(len(scores)):
+        start = i
+        end = i + win_size
+        aggregated[start:end] += scores[i]
+        counts[start:end] += 1
+    
+    aggregated /= np.where(counts == 0, 1, counts)  # 평균 계산
+    return aggregated
 
 
 class EarlyStopping:
-    def __init__(self, patience=7, verbose=False, dataset_name='', delta=0):
+    def __init__(self, patience=10, verbose=False, dataset_name='', delta=0):
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
@@ -36,27 +56,33 @@ class EarlyStopping:
         self.delta = delta
         self.dataset = dataset_name
 
-    def __call__(self, val_loss, val_loss2, model, path):
-        score = -val_loss
-        score2 = -val_loss2
+    def __call__(self, val_loss,val_loss2, model, path):
+        score = val_loss
+        score2 = val_loss2
+
         if self.best_score is None:
             self.best_score = score
             self.best_score2 = score2
             self.save_checkpoint(val_loss, val_loss2, model, path)
-        elif score < self.best_score + self.delta or score2 < self.best_score2 + self.delta:
+
+        elif ((score - self.best_score + self.delta) + (score2 - self.best_score2 + self.delta)) < 0:
+            print(f'score changed (loss1 증가량 + loss2 감소량): {-((score - self.best_score + self.delta) + (score2 - self.best_score2 + self.delta)):.6f} ')
+            self.counter = 0
+            self.best_score = score
+            self.best_score2 = score2
+            self.save_checkpoint(val_loss, val_loss2, model, path)
+            
+
+        else:
             self.counter += 1
             print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_score = score
-            self.best_score2 = score2
-            self.save_checkpoint(val_loss, val_loss2, model, path)
-            self.counter = 0
 
-    def save_checkpoint(self, val_loss, val_loss2, model, path):
+    def save_checkpoint(self, val_loss,val_loss2, model, path):
         if self.verbose:
-            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+            print(f'Validation loss1 change  : {self.val_loss_min:.6f} --> {val_loss:.6f}.')
+            print(f'Validation loss2 change  : {self.val_loss2_min:.6f} --> {val_loss2:.6f}.')
         torch.save(model.state_dict(), os.path.join(path, str(self.dataset) + '_checkpoint.pth'))
         self.val_loss_min = val_loss
         self.val_loss2_min = val_loss2
@@ -71,24 +97,28 @@ class Solver(object):
 
         self.train_loader = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
                                                mode='train',
-                                               dataset=self.dataset)
+                                               dataset=self.dataset,L=self.L)
         self.vali_loader = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
                                               mode='val',
-                                              dataset=self.dataset)
+                                              dataset=self.dataset,L=self.L)
         self.test_loader = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
                                               mode='test',
-                                              dataset=self.dataset)
-        self.thre_loader = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                              mode='thre',
-                                              dataset=self.dataset)
+                                              dataset=self.dataset,L=self.L)
+
 
         self.build_model()
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.criterion = nn.MSELoss()
+        self.decay_step = 0  
 
     def build_model(self):
         self.model = AnomalyTransformer(win_size=self.win_size, enc_in=self.input_c, c_out=self.output_c, e_layers=3)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+
+        self.optimizer=torch.optim.Adam([
+                        {'params': self.model.series_params, 'lr': self.lr, 'name': 'series'},
+                        {'params': self.model.other_params, 'lr': self.lr, 'name': 'other'},
+                        {'params': self.model.prior_params, 'lr': self.lr*10, 'name': 'prior'}
+                    ])
 
         if torch.cuda.is_available():
             self.model.cuda()
@@ -98,118 +128,159 @@ class Solver(object):
 
         loss_1 = []
         loss_2 = []
-        for i, (input_data, _) in enumerate(vali_loader):
-            input = input_data.float().to(self.device)
-            output, series, prior, _ = self.model(input)
-            series_loss = 0.0
-            prior_loss = 0.0
-            for u in range(len(prior)):
-                series_loss += (torch.mean(my_kl_loss(series[u], (
-                        prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                               self.win_size)).detach())) + torch.mean(
-                    my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)).detach(),
-                        series[u])))
-                prior_loss += (torch.mean(
-                    my_kl_loss((prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                       self.win_size)),
-                               series[u].detach())) + torch.mean(
-                    my_kl_loss(series[u].detach(),
-                               (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                       self.win_size)))))
-            series_loss = series_loss / len(prior)
-            prior_loss = prior_loss / len(prior)
-
-            rec_loss = self.criterion(output, input)
-            loss_1.append((rec_loss - self.k * series_loss).item())
-            loss_2.append((rec_loss + self.k * prior_loss).item())
-
-        return np.average(loss_1), np.average(loss_2)
-
-    def train(self):
-
-        print("======================TRAIN MODE======================")
-
-        time_now = time.time()
-        path = self.model_save_path
-        if not os.path.exists(path):
-            os.makedirs(path)
-        early_stopping = EarlyStopping(patience=3, verbose=True, dataset_name=self.dataset)
-        train_steps = len(self.train_loader)
-
-        for epoch in range(self.num_epochs):
-            iter_count = 0
-            loss1_list = []
-
-            epoch_time = time.time()
-            self.model.train()
-            for i, (input_data, labels) in enumerate(self.train_loader):
-
-                self.optimizer.zero_grad()
-                iter_count += 1
+        rec_losses = []
+        with torch.no_grad():  
+            for i, (input_data, _) in enumerate(vali_loader):
                 input = input_data.float().to(self.device)
-
                 output, series, prior, _ = self.model(input)
-
-                # calculate Association discrepancy
+                rec_loss = self.criterion(output, input)
                 series_loss = 0.0
                 prior_loss = 0.0
                 for u in range(len(prior)):
-                    series_loss += (torch.mean(my_kl_loss(series[u], (
+                    series_loss += torch.mean(my_kl_loss(series[u], (
                             prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach())) + torch.mean(
-                        my_kl_loss((prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                           self.win_size)).detach(),
-                                   series[u])))
-                    prior_loss += (torch.mean(my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach())) + torch.mean(
-                        my_kl_loss(series[u].detach(), (
-                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                       self.win_size)))))
-                series_loss = series_loss / len(prior)
-                prior_loss = prior_loss / len(prior)
+                                                                                                   self.win_size))))
+                    prior_loss += torch.mean(my_kl_loss(
+                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                    self.win_size)),
+                            series[u]))
+                    
+                series_loss = rec_loss - self.k * (series_loss/ len(prior))
+                prior_loss = rec_loss + self.k * (prior_loss / len(prior))
 
-                rec_loss = self.criterion(output, input)
+                #rec_loss = self.criterion(output, input)
+                rec_losses.append(rec_loss.item())
 
-                loss1_list.append((rec_loss - self.k * series_loss).item())
-                loss1 = rec_loss - self.k * series_loss
-                loss2 = rec_loss + self.k * prior_loss
+                loss_1.append(series_loss.item())
+                loss_2.append(prior_loss.item())
+            return np.average(loss_1), np.average(loss_2), np.average(rec_losses)
+    def profiler_context(self):
+        if self.enable_profiler:
+            return torch.profiler.profile(
+                schedule=torch.profiler.schedule(wait=1, warmup=1, active=2, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/{self.dataset}'),
+                record_shapes=True,
+                with_stack=True
+            )
+        else:
+            return nullcontext()
+    def train(self):
 
-                if (i + 1) % 100 == 0:
-                    speed = (time.time() - time_now) / iter_count
-                    left_time = speed * ((self.num_epochs - epoch) * train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+        print("======================TRAIN MODE======================")
+        debug_mode = False
+        self.enable_profiler = False  
+        #self.train()
+        with torch.autograd.detect_anomaly() if debug_mode else contextlib.nullcontext():
+            time_now = time.time()
+            path = self.model_save_path
+            if not os.path.exists(path):
+                os.makedirs(path)
+            early_stopping = EarlyStopping(patience=10, verbose=True, dataset_name=self.dataset)
+            train_steps = len(self.train_loader)
+            with self.profiler_context() as prof:
+                for epoch in range(self.num_epochs):
                     iter_count = 0
-                    time_now = time.time()
+                    loss1_list = []
+                    loss2_list = []
+                    epoch_time = time.time()
+                    self.model.train()
 
-                # Minimax strategy
-                loss1.backward(retain_graph=True)
-                loss2.backward()
-                self.optimizer.step()
+                    for i, (input_data, labels) in enumerate(self.train_loader):
 
-            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
-            train_loss = np.average(loss1_list)
 
-            vali_loss1, vali_loss2 = self.vali(self.test_loader)
+                        iter_count += 1
+                        input = input_data.float().to(self.device)
 
-            print(
-                "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} ".format(
-                    epoch + 1, train_steps, train_loss, vali_loss1))
-            early_stopping(vali_loss1, vali_loss2, self.model, path)
-            if early_stopping.early_stop:
-                print("Early stopping")
-                break
-            adjust_learning_rate(self.optimizer, epoch + 1, self.lr)
+                        
+
+                        # calculate Association discrepancy
+                        series_loss = 0.0
+                        prior_loss = 0.0
+
+                        # freeze the prior parameters
+                        for param in list(self.model.series_params)+ list(self.model.other_params) :
+                            param.requires_grad = True
+                        for param in list(self.model.prior_params):#+ list(self.model.other_params):
+                            param.requires_grad = False
+                        output, series, prior, _ = self.model(input)
+                        rec_loss = self.criterion(output, input)
+                        self.optimizer.zero_grad()
+                        
+                        
+                        for u in range(len(prior)):
+                            series_loss += torch.mean(my_kl_loss(series[u], (
+                                    prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                        self.win_size))))
+                        series_loss = series_loss / len(prior)    
+                        loss1 = rec_loss - self.k * series_loss
+
+                        loss1.backward()
+
+                        self.optimizer.step()
+    
+                    
+                        
+                        
+                        # freeze the series parameters
+                        for param in list(self.model.series_params)+ list(self.model.other_params):
+                            param.requires_grad = False
+                        for param in list(self.model.prior_params):#+ list(self.model.other_params):
+                            param.requires_grad = True
+
+                        output, series, prior, _ = self.model(input)
+                        rec_loss = self.criterion(output, input)
+                        self.optimizer.zero_grad()
+                        
+                        
+                        for u in range(len(prior)):    
+                            prior_loss +=  torch.mean(my_kl_loss(
+                                (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                        self.win_size)),
+                                series[u]))
+                        prior_loss = prior_loss / len(prior)
+                        loss2 = rec_loss + self.k * prior_loss
+
+                        loss2.backward()
+
+                        self.optimizer.step()                
+     
+                        loss1_list.append(series_loss.item())
+                        loss2_list.append(prior_loss.item())
+
+                        
+
+
+
+                        if self.enable_profiler:
+                            prof.step()
+
+
+                    print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+                    train_loss1 = np.average(loss1_list)
+                    train_loss2 = np.average(loss2_list)
+
+
+                    vali_loss1, vali_loss2, val_rec_loss = self.vali(self.test_loader)
+
+                    print(
+                        "Epoch: {0}, Steps: {1} | Train Loss1: {2:.7f} Train Loss2: {3:.7f} Vali Loss1: {4:.7f} Vali Loss2: {5:.7f} val_rec_loss : {6:.7f}".format(
+                            epoch + 1, train_steps, train_loss1,train_loss2, vali_loss1,vali_loss2, val_rec_loss))
+                    early_stopping(vali_loss1,vali_loss2, self.model, path)
+                    if early_stopping.early_stop:
+                        print("Early stopping")
+                        break
+                    if early_stopping.counter != 0 and early_stopping.counter % 3 == 0:
+                        self.decay_step += 1
+                        adjust_learning_rate(self.optimizer, self.decay_step, self.lr)
+
+
 
     def test(self):
         self.model.load_state_dict(
             torch.load(
-                os.path.join(str(self.model_save_path), str(self.dataset) + '_checkpoint.pth')))
+                os.path.join(str(self.model_save_path), str(self.dataset) + '_checkpoint.pth'),weights_only=True))
         self.model.eval()
-        temperature = 50
+        temperature = 3
 
         print("======================TEST MODE======================")
 
@@ -217,145 +288,102 @@ class Solver(object):
 
         # (1) stastic on the train set
         attens_energy = []
-        for i, (input_data, labels) in enumerate(self.train_loader):
-            input = input_data.float().to(self.device)
-            output, series, prior, _ = self.model(input)
-            loss = torch.mean(criterion(input, output), dim=-1)
-            series_loss = 0.0
-            prior_loss = 0.0
-            for u in range(len(prior)):
-                if u == 0:
-                    series_loss = my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss = my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+        with torch.no_grad():
+            for i, (input_data, labels) in enumerate(self.train_loader):
+                input = input_data.float().to(self.device)
+                output, series, prior, _ = self.model(input)
+                loss = torch.mean(criterion(input, output), dim=-1)
+                series_loss = 0.0
+                prior_loss = 0.0
+                for u in range(len(prior)):
+                    if u == 0:
+                        series_loss = my_kl_loss(series[u], (
+                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                       self.win_size))) * temperature
+                        prior_loss = my_kl_loss(
+                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                    self.win_size)),
+                            series[u]) * temperature               
+                    else:
+                        series_loss += my_kl_loss(series[u], (
+                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                       self.win_size))) * temperature
+                        prior_loss += my_kl_loss(
+                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                    self.win_size)),
+                            series[u]) * temperature
+
+                metric = torch.softmax(series_loss + prior_loss, dim=-1)
+                cri = metric * loss
+                cri = cri.detach().cpu().numpy()
+                cri = np.mean(cri, axis=-1)
+                attens_energy.append(cri)
+
+            attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
+            train_energy = np.array(attens_energy)
+
+            combined_energy = train_energy
+            thresh = np.percentile(combined_energy, 100-self.anormly_ratio)
+            print("Threshold :", thresh)
+
+            # (3) evaluation on the test set
+            test_labels = []
+            attens_energy = []
+            for i, (input_data, labels) in enumerate(self.test_loader):
+                input = input_data.float().to(self.device)
+                output, series, prior, _ = self.model(input)
+
+                loss = torch.mean(criterion(input, output), dim=-1)
+
+                series_loss = 0.0
+                prior_loss = 0.0
+                for u in range(len(prior)):
+                    if u == 0:
+                        series_loss = my_kl_loss(series[u], (
+                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                       self.win_size))) * temperature
+                        prior_loss = my_kl_loss(
+                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
                                                                                                 self.win_size)),
-                        series[u].detach()) * temperature
-                else:
-                    series_loss += my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss += my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                            series[u]) * temperature
+                    else:
+                        series_loss += my_kl_loss(series[u], (
+                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                       self.win_size))) * temperature
+                        prior_loss +=  my_kl_loss(
+                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
                                                                                                 self.win_size)),
-                        series[u].detach()) * temperature
+                            series[u]) * temperature
+                metric = torch.softmax(series_loss + prior_loss, dim=-1)
 
-            metric = torch.softmax((-series_loss - prior_loss), dim=-1)
-            cri = metric * loss
-            cri = cri.detach().cpu().numpy()
-            attens_energy.append(cri)
+                cri = metric * loss
+                cri = cri.detach().cpu().numpy()
+                cri = np.mean(cri, axis=-1)
 
-        attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
-        train_energy = np.array(attens_energy)
+                attens_energy.append(cri)
 
-        # (2) find the threshold
-        attens_energy = []
-        for i, (input_data, labels) in enumerate(self.thre_loader):
-            input = input_data.float().to(self.device)
-            output, series, prior, _ = self.model(input)
+            attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
 
-            loss = torch.mean(criterion(input, output), dim=-1)
+            test_energy = np.array(attens_energy)
+            try:
+                test_labels_path= os.path.join(self.data_path, str(self.dataset) + '_test_label.npy')
+                test_labels = np.load(test_labels_path)
+            except(FileNotFoundError, OSError):
+                test_labels_path= os.path.join(self.data_path, 'test_label.csv')
+                test_labels = np.nan_to_num(pd.read_csv(test_labels_path).iloc[:, 1:])
+            test_energy = window_to_original(test_energy, win_size=100, original_length=test_labels.shape[0])
 
-            series_loss = 0.0
-            prior_loss = 0.0
-            for u in range(len(prior)):
-                if u == 0:
-                    series_loss = my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss = my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach()) * temperature
-                else:
-                    series_loss += my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss += my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach()) * temperature
-            # Metric
-            metric = torch.softmax((-series_loss - prior_loss), dim=-1)
-            cri = metric * loss
-            cri = cri.detach().cpu().numpy()
-            attens_energy.append(cri)
 
-        attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
-        test_energy = np.array(attens_energy)
-        combined_energy = np.concatenate([train_energy, test_energy], axis=0)
-        thresh = np.percentile(combined_energy, 100 - self.anormly_ratio)
-        print("Threshold :", thresh)
+            
+            pred = (test_energy > thresh).astype(int)
+            np.save(os.path.join(self.model_save_path, str(self.dataset) + 'test_energy.npy'), test_energy)
 
-        # (3) evaluation on the test set
-        test_labels = []
-        attens_energy = []
-        for i, (input_data, labels) in enumerate(self.thre_loader):
-            input = input_data.float().to(self.device)
-            output, series, prior, _ = self.model(input)
 
-            loss = torch.mean(criterion(input, output), dim=-1)
-
-            series_loss = 0.0
-            prior_loss = 0.0
-            for u in range(len(prior)):
-                if u == 0:
-                    series_loss = my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss = my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach()) * temperature
-                else:
-                    series_loss += my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss += my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach()) * temperature
-            metric = torch.softmax((-series_loss - prior_loss), dim=-1)
-
-            cri = metric * loss
-            cri = cri.detach().cpu().numpy()
-            attens_energy.append(cri)
-            test_labels.append(labels)
-
-        attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
-        test_labels = np.concatenate(test_labels, axis=0).reshape(-1)
-        test_energy = np.array(attens_energy)
-        test_labels = np.array(test_labels)
-
-        pred = (test_energy > thresh).astype(int)
-
-        gt = test_labels.astype(int)
+            gt = test_labels.astype(int)
 
         print("pred:   ", pred.shape)
         print("gt:     ", gt.shape)
 
-        # detection adjustment: please see this issue for more information https://github.com/thuml/Anomaly-Transformer/issues/14
-        anomaly_state = False
-        for i in range(len(gt)):
-            if gt[i] == 1 and pred[i] == 1 and not anomaly_state:
-                anomaly_state = True
-                for j in range(i, 0, -1):
-                    if gt[j] == 0:
-                        break
-                    else:
-                        if pred[j] == 0:
-                            pred[j] = 1
-                for j in range(i, len(gt)):
-                    if gt[j] == 0:
-                        break
-                    else:
-                        if pred[j] == 0:
-                            pred[j] = 1
-            elif gt[i] == 0:
-                anomaly_state = False
-            if anomaly_state:
-                pred[i] = 1
 
         pred = np.array(pred)
         gt = np.array(gt)
@@ -364,12 +392,22 @@ class Solver(object):
 
         from sklearn.metrics import precision_recall_fscore_support
         from sklearn.metrics import accuracy_score
+        from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve, auc
         accuracy = accuracy_score(gt, pred)
         precision, recall, f_score, support = precision_recall_fscore_support(gt, pred,
                                                                               average='binary')
-        print(
-            "Accuracy : {:0.4f}, Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(
-                accuracy, precision,
-                recall, f_score))
+        # ROC
+        fpr, tpr, _ = roc_curve(gt, test_energy)
+        roc_auc = auc(fpr, tpr)
 
-        return accuracy, precision, recall, f_score
+        # PR
+        pre, rec, _ = precision_recall_curve(gt, test_energy)
+        pr_auc = auc(rec, pre)
+
+        print(
+            "Accuracy : {:0.4f}, Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f}, roc_auc : {:0.4f}, pr_acu : {:0.4f}".format(
+                accuracy, precision,
+                recall, f_score,
+                roc_auc, pr_auc))
+
+        return accuracy, precision, recall, f_score, roc_auc, pr_auc

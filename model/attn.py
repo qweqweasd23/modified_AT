@@ -19,46 +19,53 @@ class TriangularCausalMask():
 
 
 class AnomalyAttention(nn.Module):
-    def __init__(self, win_size, mask_flag=True, scale=None, attention_dropout=0.0, output_attention=False):
+    def __init__(self, win_size, mask_flag=True, scale=None, attention_dropout=0.3, output_attention=False):
         super(AnomalyAttention, self).__init__()
         self.scale = scale
         self.mask_flag = mask_flag
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
         window_size = win_size
-        self.distances = torch.zeros((window_size, window_size)).cuda()
-        for i in range(window_size):
-            for j in range(window_size):
-                self.distances[i][j] = abs(i - j)
+        distances = torch.zeros((window_size, window_size))
+        self.register_buffer('distances', distances)
+        with torch.no_grad():
+            for i in range(window_size):
+                for j in range(window_size):
+                    self.distances[i][j] = abs(i - j)
 
-    def forward(self, queries, keys, values, sigma, attn_mask):
-        B, L, H, E = queries.shape
+
+    def forward(self, series_queries,series_keys,values, sigma, attn_mask):
+        B, L, H, E = series_queries.shape
         _, S, _, D = values.shape
         scale = self.scale or 1. / sqrt(E)
 
-        scores = torch.einsum("blhe,bshe->bhls", queries, keys)
+        # 1. Series 어텐션 계산 (전역적 패턴)
+        series_scores = torch.einsum("blhe,bshe->bhls", series_queries, series_keys)
         if self.mask_flag:
             if attn_mask is None:
-                attn_mask = TriangularCausalMask(B, L, device=queries.device)
-            scores.masked_fill_(attn_mask.mask, -np.inf)
-        attn = scale * scores
+                attn_mask = TriangularCausalMask(B, L, device=series_queries.device)
+            series_scores = series_scores.masked_fill(attn_mask.mask, -np.inf)
+        series_attn = torch.softmax(series_scores * scale, dim=-1)
 
-        sigma = sigma.transpose(1, 2)  # B L H ->  B H L
-        window_size = attn.shape[-1]
+        # 2. Prior 계산 (국소적 패턴)
+        sigma = sigma.transpose(1, 2)  # B L H → B H L
         sigma = torch.sigmoid(sigma * 5) + 1e-5
-        sigma = torch.pow(3, sigma) - 1
-        sigma = sigma.unsqueeze(-1).repeat(1, 1, 1, window_size)  # B H L L
-        prior = self.distances.unsqueeze(0).unsqueeze(0).repeat(sigma.shape[0], sigma.shape[1], 1, 1).cuda()
-        prior = 1.0 / (math.sqrt(2 * math.pi) * sigma) * torch.exp(-prior ** 2 / 2 / (sigma ** 2))
+        sigma = torch.pow(3, sigma.clone()) - 1 
+        sigma = sigma.unsqueeze(-1).repeat(1, 1, 1, L) # B H L L  #
+        prior = self.distances.unsqueeze(0).unsqueeze(0).repeat(B, H, 1, 1) # 
+        prior = 1.0 / (math.sqrt(2 * math.pi) * sigma) * torch.exp(-prior**2 / 2 / (sigma**2))
 
-        series = self.dropout(torch.softmax(attn, dim=-1))
-        V = torch.einsum("bhls,bshd->blhd", series, values)
+        # 3. 출력 계산
+        series_out = torch.einsum("bhls,bshd->blhd", series_attn, values)
+        prior_out = torch.einsum("bhls,bshd->blhd", prior, values)
+        final_out = series_out + prior_out 
+        B, L, H, D = final_out.shape
 
         if self.output_attention:
-            return (V.contiguous(), series, prior, sigma)
+            return (final_out.contiguous(), series_attn, prior, sigma)
         else:
-            return (V.contiguous(), None)
-
+            return (final_out.contiguous(), None)
+        
 
 class AttentionLayer(nn.Module):
     def __init__(self, attention, d_model, n_heads, d_keys=None,
@@ -69,35 +76,53 @@ class AttentionLayer(nn.Module):
         d_values = d_values or (d_model // n_heads)
         self.norm = nn.LayerNorm(d_model)
         self.inner_attention = attention
-        self.query_projection = nn.Linear(d_model,
+        self.series_query_projection = nn.Linear(d_model,
                                           d_keys * n_heads)
-        self.key_projection = nn.Linear(d_model,
+        self.series_key_projection = nn.Linear(d_model,
                                         d_keys * n_heads)
         self.value_projection = nn.Linear(d_model,
                                           d_values * n_heads)
         self.sigma_projection = nn.Linear(d_model,
                                           n_heads)
         self.out_projection = nn.Linear(d_values * n_heads, d_model)
-
         self.n_heads = n_heads
 
+        
+
+    def series_parameters(self):
+        return list(self.series_query_projection.parameters()) + \
+               list(self.series_key_projection.parameters())
+
+    def prior_parameters(self):
+        sigma_params = list(self.sigma_projection.parameters())
+        for param in sigma_params:
+            param.requires_grad = True
+
+        return sigma_params
+    
     def forward(self, queries, keys, values, attn_mask):
         B, L, _ = queries.shape
         _, S, _ = keys.shape
         H = self.n_heads
         x = queries
-        queries = self.query_projection(queries).view(B, L, H, -1)
-        keys = self.key_projection(keys).view(B, S, H, -1)
-        values = self.value_projection(values).view(B, S, H, -1)
-        sigma = self.sigma_projection(x).view(B, L, H)
+        series_queries = self.series_query_projection(queries)
+        series_queries = series_queries.view(B, L, H, -1).contiguous()
+        series_keys = self.series_key_projection(keys.clone())
+        series_keys = series_keys.reshape(B, S, H, -1).contiguous()
+        values = self.value_projection(values).view(B, S, H, -1).contiguous()
+
+        sigma = self.sigma_projection(x)
+        sigma = sigma.view(B, L, H).contiguous()
+        sigma = torch.sigmoid(sigma) * 2 + 0.1
 
         out, series, prior, sigma = self.inner_attention(
-            queries,
-            keys,
+            series_queries,
+            series_keys,
             values,
             sigma,
             attn_mask
         )
-        out = out.view(B, L, -1)
+        B, L, H, D = out.shape
+        out = out.reshape(B, L, -1)
 
         return self.out_projection(out), series, prior, sigma
