@@ -110,7 +110,7 @@ fc: Linear(64→55)
 - **MSL**: Significant score divergence at 38000-40000 indices  
 - **SMAP/PSM**: Minimal practical difference despite statistical significance
 
-### 3.6 Epoch Analysis
+### 3.6 Score Analysis
 ![](https://blog.kakaocdn.net/dn/OUhab/btsNB58e9tA/kUEEYt48v8J2ktxiol5MNK/img.png)  
 (Epoch progression shows metric convergence)
 
