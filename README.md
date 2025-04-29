@@ -28,7 +28,7 @@ For full report in Korean with figures, please refer to the blog post: [(https:/
 Core idea: Anomalies exhibit weakened global associations and strengthened local associations.
 
 ### Key Components:
-- **Prior(P)**: Distance-based Gaussian kernel values (non-trainable)  
+- **Prior(P)**: Distance-based Gaussian kernel values 
 - **Series(S)**: Attention scores based on reconstruction loss  
 - **Loss Functions**:  
   `prior_loss(PL) = KL(P||S.detach()) + KL(S.detach()||P)`  
@@ -124,10 +124,6 @@ fc: Linear(64→55)
 4. Learnable prior parameters showed limited impact  
 5. Dynamic thresholding may unlock ass-dis potential  
 
-**Future Work**:  
-- Implement adaptive thresholding  
-- Enhance data preprocessing for SMAP  
-- Explore hybrid architectures  
 
 ---
 
