@@ -21,22 +21,24 @@ class PSMSegLoader(object):
 
         data = pd.read_csv(data_path + '/train.csv')
         data = np.nan_to_num(data.values[:, 1:])
-
+        
         test_data = pd.read_csv(data_path + '/test.csv')
-        test_data = np.nan_to_num(test_data.values[:, 1:])
+        self.test = np.nan_to_num(test_data.values[:, 1:])
 
         self.train = data
-        self.test = test_data
-        self.val = self.test
+        data_len = len(self.train)
+        self.train = self.train[:int(data_len * 0.8)]
+        self.val = self.train[int(data_len * 0.8):]
+
 
         self.test_labels = pd.read_csv(data_path + '/test_label.csv').values[:, 1:]
 
         if self.mode == "train":
             self.data = self.train
-            self.labels = np.zeros((len(self.data), 1), dtype=np.float32)  # train에는 라벨 없음
+            self.labels = np.zeros((len(self.train), 1), dtype=np.float32)  # train에는 라벨 없음
         elif self.mode == "val":
             self.data = self.val
-            self.labels = self.test_labels
+            self.labels = np.zeros((len(self.val), 1), dtype=np.float32)
         elif self.mode == "test":
             self.data = self.test
             self.labels = self.test_labels
@@ -50,21 +52,14 @@ class PSMSegLoader(object):
 
     def __getitem__(self, index):
         index = index * self.step
-        start = index - self.win_size + 1
-        end = index + 1
+        start = index
+        end = index + self.win_size
 
-        # Ensure bounds
-        if start < 0:
-            pad_len = -start
-            seq = np.pad(self.data[0:end], ((pad_len, 0), (0, 0)), mode='edge')
-            label_slice = self.labels[0:end]
-            label = np.pad(label_slice, ((pad_len, 0), (0, 0)), mode='edge')
-        elif end > len(self.data):
-            # 이 경우 잘라내기 (또는 아래처럼 길이 체크에서 제외할 수 있음)
+        if end > len(self.data):
             raise IndexError("Index exceeds dataset length after sliding window.")
-        else:
-            seq = self.data[start:end]
-            label = self.labels[start:end]
+
+        seq = self.data[start:end]
+        label = self.labels[start:end]
 
         if label.ndim == 1:
             label = label[:, np.newaxis]
@@ -85,15 +80,17 @@ class MSLSegLoader(object):
         data = np.load(data_path + "/MSL_train.npy")
         self.test = np.load(data_path + "/MSL_test.npy")
         self.train = data
-        self.val = self.test
+        data_len = len(self.train)
+        self.train = self.train[:int(data_len * 0.8)]
+        self.val = self.train[int(data_len * 0.8):]
         self.test_labels = np.load(data_path + "/MSL_test_label.npy")
                 
         if self.mode == "train":
             self.data = self.train
-            self.labels = self.test_labels
+            self.labels = np.zeros((len(self.train), 1), dtype=np.float32)
         elif self.mode == "val":
             self.data = self.val
-            self.labels = self.test_labels
+            self.labels = np.zeros((len(self.val), 1), dtype=np.float32)
         elif self.mode == "test":
             self.data = self.test
             self.labels = self.test_labels
@@ -103,24 +100,15 @@ class MSLSegLoader(object):
 
     def __getitem__(self, index):
         index = index * self.step
-        start = index - self.win_size + 1
-        end = start + self.win_size
+        start = index
+        end = index + self.win_size
 
-        
-        if start < 0:
-            pad_len = -start
-            seq = np.pad(self.data[0:end], ((pad_len, 0), (0, 0)), mode='edge')
-
-            label_data = self.labels[0:end]
-            if label_data.ndim == 1:
-                label_data = label_data[:, np.newaxis]  
-            label = np.pad(label_data, ((pad_len, 0), (0, 0)), mode='edge')
-        else:
-            seq = self.data[start:end]
-            label = self.labels[start:end]
-            if label.ndim == 1:
-                label = label[:, np.newaxis]
-
+        if end > len(self.data):
+            raise IndexError("Index exceeds dataset length after sliding window.")
+        seq = self.data[start:end]
+        label = self.labels[start:end]
+        if label.ndim == 1:
+            label = label[:, np.newaxis]
         return np.float32(seq), np.float32(label)
 
 
@@ -139,15 +127,17 @@ class SMAPSegLoader(object):
         self.test_labels = test_labels
 
         
-        self.val = self.test
+        data_len = len(self.train)
+        self.train = self.train[:int(data_len * 0.8)]
+        self.val = self.train[int(data_len * 0.8):]
 
         
         if self.mode == "train":
             self.data = self.train
-            self.labels = self.test_labels
+            self.labels = np.zeros((len(self.train), 1), dtype=np.float32)
         elif self.mode == "val":
             self.data = self.val
-            self.labels = self.test_labels
+            self.labels = np.zeros((len(self.val), 1), dtype=np.float32)
         elif self.mode == "test":
             self.data = self.test
             self.labels = self.test_labels
@@ -159,24 +149,15 @@ class SMAPSegLoader(object):
 
     def __getitem__(self, index):
         index = index * self.step
-        start = index - self.win_size + 1
-        end = start + self.win_size
+        start = index
+        end = index + self.win_size
 
-        
-        if start < 0:
-            pad_len = -start
-            seq = np.pad(self.data[0:end], ((pad_len, 0), (0, 0)), mode='edge')
-
-            label_data = self.labels[0:end]
-            if label_data.ndim == 1:
-                label_data = label_data[:, np.newaxis]  
-            label = np.pad(label_data, ((pad_len, 0), (0, 0)), mode='edge')
-        else:
-            seq = self.data[start:end]
-            label = self.labels[start:end]
-            if label.ndim == 1:
-                label = label[:, np.newaxis]
-
+        if end > len(self.data):
+            raise IndexError("Index exceeds dataset length after sliding window.")
+        seq = self.data[start:end]
+        label = self.labels[start:end]
+        if label.ndim == 1:
+            label = label[:, np.newaxis]
         return np.float32(seq), np.float32(label)
     
 class SMDSegLoader(object):
@@ -191,15 +172,16 @@ class SMDSegLoader(object):
         self.test_labels = np.load(data_path + "/SMD_test_label.npy")
 
         data_len = len(self.train)
+        self.train = self.train[:int(data_len * 0.8)]
         self.val = self.train[int(data_len * 0.8):]
 
         
         if self.mode == "train":
             self.data = self.train
-            self.labels = self.test_labels  
+            self.labels = np.zeros((len(self.train), 1), dtype=np.float32) 
         elif self.mode == "val":
             self.data = self.val
-            self.labels = self.test_labels  
+            self.labels = np.zeros((len(self.val), 1), dtype=np.float32)  
         elif self.mode == "test":
             self.data = self.test
             self.labels = self.test_labels
@@ -209,24 +191,15 @@ class SMDSegLoader(object):
 
     def __getitem__(self, index):
         index = index * self.step
-        start = index - self.win_size + 1
-        end = start + self.win_size
+        start = index
+        end = index + self.win_size
 
-        
-        if start < 0:
-            pad_len = -start
-            seq = np.pad(self.data[0:end], ((pad_len, 0), (0, 0)), mode='edge')
-
-            label_data = self.labels[0:end]
-            if label_data.ndim == 1:
-                label_data = label_data[:, np.newaxis]  
-            label = np.pad(label_data, ((pad_len, 0), (0, 0)), mode='edge')
-        else:
-            seq = self.data[start:end]
-            label = self.labels[start:end]
-            if label.ndim == 1:
-                label = label[:, np.newaxis]
-
+        if end > len(self.data):
+            raise IndexError("Index exceeds dataset length after sliding window.")
+        seq = self.data[start:end]
+        label = self.labels[start:end]
+        if label.ndim == 1:
+            label = label[:, np.newaxis]
         return np.float32(seq), np.float32(label)
 
 

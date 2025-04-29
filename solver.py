@@ -288,6 +288,7 @@ class Solver(object):
 
         # (1) stastic on the train set
         attens_energy = []
+        attens_energy2 = []
         with torch.no_grad():
             for i, (input_data, labels) in enumerate(self.train_loader):
                 input = input_data.float().to(self.device)
@@ -295,40 +296,54 @@ class Solver(object):
                 loss = torch.mean(criterion(input, output), dim=-1)
                 series_loss = 0.0
                 prior_loss = 0.0
+                # metric 2 = S + P
+                S_list, P_list = [], []
                 for u in range(len(prior)):
+                    P_normalized = prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, self.win_size)
                     if u == 0:
-                        series_loss = my_kl_loss(series[u], (
-                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                       self.win_size))) * temperature
-                        prior_loss = my_kl_loss(
-                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                    self.win_size)),
-                            series[u]) * temperature               
+                        series_loss = my_kl_loss(series[u], P_normalized) * temperature
+                        prior_loss = my_kl_loss(P_normalized, series[u]) * temperature
+                        S_list.append(series[u]* temperature)
+                        P_list.append(P_normalized* temperature)               
                     else:
-                        series_loss += my_kl_loss(series[u], (
-                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                       self.win_size))) * temperature
-                        prior_loss += my_kl_loss(
-                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                    self.win_size)),
-                            series[u]) * temperature
+                        series_loss += my_kl_loss(series[u], P_normalized) * temperature
+                        prior_loss += my_kl_loss( P_normalized, series[u]) * temperature
+                        S_list.append(series[u]* temperature)
+                        P_list.append(P_normalized* temperature)                          
 
-                metric = torch.softmax(series_loss + prior_loss, dim=-1)
+                metric = torch.softmax((-series_loss - prior_loss), dim=-1)
+                S_mean=                torch.mean(torch.stack(S_list), dim=0)
+                P_mean=                torch.mean(torch.stack(P_list), dim=0)
+                metric2=S_mean+P_mean 
+                metric2 = metric2.mean(dim=1)    # head 평균 (batch=256, window=100, window=100)
+                metric2 = metric2.mean(dim=-1)   # window 축 평균 (batch=256, window=100)
+                metric2 = torch.softmax(metric2, dim=-1)   # softmax (batch=256, window=100)                #print("series_loss shape:", series_loss.shape)
+                #print("metric2 shape:", metric2.shape)
+                #print("loss shape:", loss.shape)
+                #print("metric shape:", metric.shape)
                 cri = metric * loss
                 cri = cri.detach().cpu().numpy()
                 cri = np.mean(cri, axis=-1)
                 attens_energy.append(cri)
-
+                cri2=metric2 * loss
+                cri2 = cri2.detach().cpu().numpy()
+                cri2 = np.mean(cri2, axis=-1)
+                attens_energy2.append(cri2)
             attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
             train_energy = np.array(attens_energy)
+            attens_energy2 = np.concatenate(attens_energy2, axis=0).reshape(-1)
+            train_energy2= np.array(attens_energy2)
 
             combined_energy = train_energy
             thresh = np.percentile(combined_energy, 100-self.anormly_ratio)
+            thresh2=np.percentile(train_energy2, 100-self.anormly_ratio)
+            print("Threshold2 :", thresh2)
             print("Threshold :", thresh)
 
             # (3) evaluation on the test set
             test_labels = []
             attens_energy = []
+            attens_energy2=[]
             for i, (input_data, labels) in enumerate(self.test_loader):
                 input = input_data.float().to(self.device)
                 output, series, prior, _ = self.model(input)
@@ -337,34 +352,39 @@ class Solver(object):
 
                 series_loss = 0.0
                 prior_loss = 0.0
+                # mertic 2 = S + P 
+                S_list, P_list = [], []
                 for u in range(len(prior)):
+                    P_normalized = prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, self.win_size)
                     if u == 0:
-                        series_loss = my_kl_loss(series[u], (
-                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                       self.win_size))) * temperature
-                        prior_loss = my_kl_loss(
-                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                            series[u]) * temperature
+                        series_loss = my_kl_loss(series[u], P_normalized) * temperature
+                        prior_loss = my_kl_loss(P_normalized, series[u]) * temperature
+                        S_list.append(series[u]* temperature)
+                        P_list.append(P_normalized* temperature)               
                     else:
-                        series_loss += my_kl_loss(series[u], (
-                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                       self.win_size))) * temperature
-                        prior_loss +=  my_kl_loss(
-                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                            series[u]) * temperature
-                metric = torch.softmax(series_loss + prior_loss, dim=-1)
-
+                        series_loss += my_kl_loss(series[u], P_normalized) * temperature
+                        prior_loss += my_kl_loss( P_normalized, series[u]) * temperature
+                        S_list.append(series[u]* temperature)
+                        P_list.append(P_normalized* temperature)  
+                metric = torch.softmax((-series_loss-prior_loss), dim=-1)
+                S_mean=                torch.mean(torch.stack(S_list), dim=0)
+                P_mean=                torch.mean(torch.stack(P_list), dim=0)
+                metric2=S_mean+P_mean              
+                metric2 = metric2.mean(dim=1)    # head 평균 (batch=256, window=100, window=100)
+                metric2 = metric2.mean(dim=-1)   # window 축 평균 (batch=256, window=100)
+                metric2 = torch.softmax(metric2, dim=-1)   # softmax (batch=256, window=100)
                 cri = metric * loss
                 cri = cri.detach().cpu().numpy()
                 cri = np.mean(cri, axis=-1)
-
+                cri2= metric2 * loss
+                cri2 = cri2.detach().cpu().numpy()
+                cri2 = np.mean(cri2, axis=-1)
                 attens_energy.append(cri)
-
+                attens_energy2.append(cri2)
             attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
-
+            attens_energy2 = np.concatenate(attens_energy2, axis=0).reshape(-1)
             test_energy = np.array(attens_energy)
+            test_energy2 = np.array(attens_energy2)
             try:
                 test_labels_path= os.path.join(self.data_path, str(self.dataset) + '_test_label.npy')
                 test_labels = np.load(test_labels_path)
@@ -372,20 +392,24 @@ class Solver(object):
                 test_labels_path= os.path.join(self.data_path, 'test_label.csv')
                 test_labels = np.nan_to_num(pd.read_csv(test_labels_path).iloc[:, 1:])
             test_energy = window_to_original(test_energy, win_size=100, original_length=test_labels.shape[0])
-
+            test_energy2 = window_to_original(test_energy2, win_size=100, original_length=test_labels.shape[0])
 
             
             pred = (test_energy > thresh).astype(int)
+            pred2 = (test_energy2 > thresh2).astype(int)
             np.save(os.path.join(self.model_save_path, str(self.dataset) + 'test_energy.npy'), test_energy)
+            np.save(os.path.join(self.model_save_path, str(self.dataset) + 'test_energy2.npy'), test_energy2)
 
 
             gt = test_labels.astype(int)
 
         print("pred:   ", pred.shape)
+        print("pred2:   ", pred2.shape)
         print("gt:     ", gt.shape)
 
 
         pred = np.array(pred)
+        pred2 = np.array(pred2)
         gt = np.array(gt)
         print("pred: ", pred.shape)
         print("gt:   ", gt.shape)
@@ -409,5 +433,21 @@ class Solver(object):
                 accuracy, precision,
                 recall, f_score,
                 roc_auc, pr_auc))
+        
+        accuracy2 = accuracy_score(gt, pred2)
+        precision2, recall2, f_score2, support2 = precision_recall_fscore_support(gt, pred2,
+                                                                              average='binary')
+        # ROC
+        fpr2, tpr2, _ = roc_curve(gt, test_energy2)
+        roc_auc2 = auc(fpr2, tpr2)
+        # PR
+        pre2, rec2, _ = precision_recall_curve(gt, test_energy2)
+        pr_auc2 = auc(rec2, pre2)
+        print(
+            "Accuracy2 : {:0.4f}, Precision2 : {:0.4f}, Recall2 : {:0.4f}, F-score2 : {:0.4f}, roc_auc2 : {:0.4f}, pr_acu2 : {:0.4f}".format(
+                accuracy2, precision2,
+                recall2, f_score2,
+                roc_auc2, pr_auc2))
+        
+        return accuracy, precision, recall, f_score, roc_auc, pr_auc, accuracy2, precision2, recall2, f_score2, roc_auc2, pr_auc2
 
-        return accuracy, precision, recall, f_score, roc_auc, pr_auc
